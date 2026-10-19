@@ -9,13 +9,15 @@ public partial class TrackView : Control
     public RhythmGame Game { get; set; } = null!;
     public bool Decorative { get; set; }
     public float JudgeY => Size.Y - 76;
+    // Use the complete visible track height, including the area below the hit line.
+    public double PixelsPerSecond => Math.Max(1, Size.Y) * Game.ScrollRate;
     private float Left => Math.Max(52, (Size.X - 520) / 2);
     private float Width => Math.Min(520, Size.X - Left - 24);
     private float LaneWidth => Width / 4;
     private Font Font => ThemeDB.FallbackFont;
     public int LaneAt(float x) => x < Left || x >= Left + Width ? -1 : (int)((x - Left) / LaneWidth);
-    public double TimeAt(float y) => Game.Cursor + (JudgeY - y) / Game.PixelsPerSecond;
-    private float Y(double time) => JudgeY - (float)((time - Game.Cursor) * Game.PixelsPerSecond);
+    public double TimeAt(float y) => Game.Cursor + (JudgeY - y) / PixelsPerSecond;
+    public float Y(double time) => JudgeY - (float)((time - Game.Cursor) * PixelsPerSecond);
 
     public override void _Ready()
     {
@@ -99,8 +101,8 @@ public partial class TrackView : Control
     {
         double beatTime = 60 / Game.Chart.Bpm;
         double step = editor ? beatTime * 4 / Game.SnapDivision : beatTime;
-        double start = Game.Cursor + (JudgeY - Size.Y) / Game.PixelsPerSecond;
-        double end = Game.Cursor + JudgeY / Game.PixelsPerSecond;
+        double start = Game.Cursor + (JudgeY - Size.Y) / PixelsPerSecond;
+        double end = Game.Cursor + JudgeY / PixelsPerSecond;
         long first = (long)Math.Floor((start - Game.Chart.Offset) / step);
         long last = (long)Math.Ceiling((end - Game.Chart.Offset) / step);
         // Even the finest subdivision is bounded to a few thousand lines per frame.
@@ -112,7 +114,7 @@ public partial class TrackView : Control
             bool fullBeat = Math.Abs(beat - Math.Round(beat)) < .00001;
             bool measure = fullBeat && ((long)Math.Round(beat) % 4 == 0);
             float y = Y(time);
-            if (!fullBeat && step * Game.PixelsPerSecond < 4) continue;
+            if (!fullBeat && step * PixelsPerSecond < 4) continue;
             DrawLine(new Vector2(Left, y), new Vector2(Left + Width, y), measure ? new Color("4b6d81") : fullBeat ? new Color("2c425b") : new Color("1d2c40"), measure ? 2 : 1);
             if (measure && editor) DrawString(Font, new Vector2(3, y - 4), $"{(int)Math.Round(beat) / 4 + 1:000}", HorizontalAlignment.Left, -1, 12, RhythmGame.Muted);
         }

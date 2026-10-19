@@ -30,6 +30,7 @@ public sealed class ChartData
 
 public static class ChartStore
 {
+    public const string DemoId = "00000000000000000000000000000001";
     public static readonly string Root = ProjectSettings.GlobalizePath(
         OS.GetCmdlineUserArgs().Any(arg => arg == "--self-test" || arg == "--visual-check")
             ? "res://.verification/charts" : "user://charts");
@@ -57,6 +58,27 @@ public static class ChartStore
                 charts.Add(chart);
             }
             catch (Exception ex) { GD.PushWarning($"无法读取谱面 {file}: {ex.Message}"); }
+        }
+        // Older versions silently forked the built-in chart whenever it was saved.
+        // Only consolidate identical demo-audio charts; preserve every different edit.
+        foreach (var group in charts.Where(c => c.IsDemo && string.IsNullOrEmpty(c.MusicPath))
+                     .GroupBy(c => JsonSerializer.Serialize(new { c.Title, c.Artist, c.Bpm, c.Offset, c.Notes }))
+                     .Where(g => g.Count() > 1).ToList())
+        {
+            var keep = group.OrderBy(c => c.Id == DemoId ? 0 : 1).ThenBy(c => c.Id, StringComparer.Ordinal).First();
+            foreach (var duplicate in group.Where(c => c != keep))
+            {
+                try
+                {
+                    string backupFolder = Path.Combine(Root, "duplicate-backups");
+                    Directory.CreateDirectory(backupFolder);
+                    // Unique backup names preserve previous backups, too.
+                    File.Move(Path.Combine(Root, duplicate.Id + ".json"),
+                        Path.Combine(backupFolder, duplicate.Id + "-" + Guid.NewGuid().ToString("N") + ".json"));
+                    charts.Remove(duplicate);
+                }
+                catch (Exception ex) { GD.PushWarning($"重复谱面备份失败：{ex.Message}"); }
+            }
         }
         return charts.OrderBy(c => c.IsDemo ? 0 : 1).ThenBy(c => c.Title).ToList();
     }
@@ -89,7 +111,7 @@ public static class ChartStore
 
     public static ChartData DemoChart()
     {
-        var chart = new ChartData { Id = "00000000000000000000000000000001", Title = "NEON FIRST LIGHT", Artist = "Oooverdose · 原创合成练习曲", Bpm = 120, IsDemo = true };
+        var chart = new ChartData { Id = DemoId, Title = "NEON FIRST LIGHT", Artist = "Oooverdose · 原创合成练习曲", Bpm = 120, IsDemo = true };
         for (int beat = 8; beat < 88; beat++)
         {
             int lane = (beat * 7 + beat / 8) % 4;

@@ -15,7 +15,9 @@ public partial class RhythmGame : Control
     public ChartData Chart { get; private set; } = new();
     public double Cursor { get; private set; }
     public double SongLength { get; private set; } = 60;
-    public double PixelsPerSecond { get; private set; } = 230;
+    private PlayerSettings settings = new();
+    public double ScrollRate => settings.ScrollRate;
+    private static string UserSettingsPath => Path.Combine(Path.GetDirectoryName(ChartStore.Root)!, "settings.cfg");
     public int SnapDivision { get; private set; } = 16;
     public bool LongTool { get; private set; }
     public bool[] KeysDown { get; } = new bool[4];
@@ -24,6 +26,7 @@ public partial class RhythmGame : Control
     public float JudgementLife { get; private set; }
     private readonly Key[] laneKeys = { Key.D, Key.F, Key.J, Key.K };
     private AudioStreamPlayer audio = null!;
+    private HitSoundPlayer hitSounds = null!;
     private VBoxContainer page = null!;
     private Label status = null!, clockLabel = null!, statsLabel = null!;
     private HSlider timeline = null!;
@@ -33,6 +36,9 @@ public partial class RhythmGame : Control
     private double playbackRate = 1, scoreValue;
     private int combo, maxCombo, perfect, great, good, miss, judgedUnits;
     private bool editorPlaying;
+    private List<double> editorHitTimes = new();
+    private int nextEditorHit;
+    private bool editorIncludeStart = true;
     private readonly Stack<List<ChartNote>> undo = new(), redo = new();
     private double dragStart = -1;
     private int dragLane = -1;
@@ -50,6 +56,9 @@ public partial class RhythmGame : Control
         Theme = MakeTheme();
         audio = new AudioStreamPlayer { VolumeDb = -5 };
         AddChild(audio);
+        settings = PlayerSettings.Load(UserSettingsPath);
+        hitSounds = new HitSoundPlayer { Settings = settings };
+        AddChild(hitSounds);
         audio.Finished += () => { audioEnded = true; editorPlaying = false; };
         confirm = new ConfirmationDialog { Title = "尚有未保存的修改", DialogText = "离开将丢失未保存的谱面修改。", OkButtonText = "放弃修改并离开", CancelButtonText = "继续编辑" };
         confirm.Confirmed += () => { dirty = false; confirmedAction?.Invoke(); confirmedAction = null; };
@@ -61,7 +70,8 @@ public partial class RhythmGame : Control
         GetWindow().FocusExited += () => { if (Current == Screen.Playing && !paused) TogglePause(); };
         try
         {
-            if (!File.Exists(Path.Combine(ChartStore.Root, "00000000000000000000000000000001.json"))) ChartStore.Save(ChartStore.DemoChart());
+            if (!File.Exists(Path.Combine(ChartStore.Root, ChartStore.DemoId + ".json"))) ChartStore.Save(ChartStore.DemoChart());
+            ChartStore.LoadAll();
         }
         catch (Exception ex) { ShowError(ex.Message); }
         ShowHome();
@@ -97,8 +107,10 @@ public partial class RhythmGame : Control
     private void ResetPage(Screen screen, string section)
     {
         audio.Stop();
+        hitSounds.StopAll();
         audio.StreamPaused = false;
         editorPlaying = false;
+        editorIncludeStart = true;
         Current = screen;
         toastLife = 0;
         dragStart = -1;
@@ -171,6 +183,8 @@ public partial class RhythmGame : Control
         edit.CustomMinimumSize = new Vector2(210, 62);
         actions.AddChild(start); actions.AddChild(edit); left.AddChild(actions);
         left.AddChild(Text("D / F / J / K   ·   长条请持续按住   ·   Esc 暂停", 16, Muted));
+        left.AddChild(SoundControls());
+        left.AddChild(SpeedControls());
         var art = new TrackView { Game = this, Decorative = true, CustomMinimumSize = new Vector2(480, 0), SizeFlagsVertical = SizeFlags.ExpandFill };
         content.AddChild(art);
         Footer("LOCAL MUSIC, YOUR RHYTHM.                                      v1.0  /  GODOT + C#");
@@ -231,7 +245,7 @@ public partial class RhythmGame : Control
         toolbar.AddChild(Button("导入音乐", ImportMusic, true));
         saveButton = Button("保存谱面  Ctrl+S", SaveChart, true);
         toolbar.AddChild(saveButton);
-        toolbar.AddChild(Button("试玩", () => { if (SaveChartCore()) StartGame(Chart, true); }));
+        toolbar.AddChild(Button("试玩", PreviewChart));
         toolbar.AddChild(Button("返回", () => Guard(() => ShowLibrary(true))));
         page.AddChild(toolbar);
         var main = new HBoxContainer { SizeFlagsVertical = SizeFlags.ExpandFill };
@@ -256,9 +270,10 @@ public partial class RhythmGame : Control
         foreach (var div in divisions) snap.AddItem($"1/{div}  ·  {4.0 / div:0.###} 拍");
         snap.Selected = Array.IndexOf(divisions, SnapDivision);
         snap.ItemSelected += index => SnapDivision = divisions[(int)index]; inspector.AddChild(snap);
-        AddNumber(inspector, "视图速度（像素 / 秒）", 80, 900, 10, PixelsPerSecond, v => PixelsPerSecond = v);
+        inspector.AddChild(SpeedControls());
         var history = new HBoxContainer();
         history.AddChild(Button("撤销", Undo)); history.AddChild(Button("重做", Redo)); inspector.AddChild(history);
+        inspector.AddChild(SoundControls(true));
         inspector.AddChild(Text("右键：删除音符或长条\n滚轮：移动时间 · Shift：精细移动\nSpace：播放 / 暂停\nCtrl+Z / Ctrl+Y：撤销 / 重做\n编辑时暂停播放，放置更准确。", 14, Muted));
         var trackPanel = new VBoxContainer { SizeFlagsHorizontal = SizeFlags.ExpandFill };
         main.AddChild(trackPanel);
@@ -322,8 +337,9 @@ public partial class RhythmGame : Control
         picker.PopupCenteredRatio(.75f);
     }
 
-    private void MarkDirty() { dirty = true; if (GodotObject.IsInstanceValid(saveButton)) saveButton.Text = "● 保存谱面  Ctrl+S"; }
+    private void MarkDirty() { dirty = true; editorIncludeStart = true; if (GodotObject.IsInstanceValid(saveButton)) saveButton.Text = "● 保存谱面  Ctrl+S"; }
     private void SaveChart() => SaveChartCore();
+    private void PreviewChart() { if (SaveChartCore()) StartGame(Chart, true); }
     private bool SaveChartCore()
     {
         try
@@ -331,8 +347,7 @@ public partial class RhythmGame : Control
             if (audio.Stream == null) throw new InvalidOperationException("请先导入音乐，再保存谱面。");
             if (string.IsNullOrWhiteSpace(Chart.Title)) throw new InvalidOperationException("请填写曲名。");
             if (Chart.Notes.Any(n => n.Time + n.Duration > SongLength + .001)) throw new InvalidOperationException("音符超出了音乐长度。");
-            // Keep the bundled example available even after it is edited.
-            if (Chart.Id == "00000000000000000000000000000001") Chart.Id = Guid.NewGuid().ToString("N");
+            // Save every existing chart in place, including the bundled example.
             ChartStore.Save(Chart); dirty = false; saveButton.Text = "保存谱面  Ctrl+S"; Toast("谱面已保存，可在「开始游戏」中选择。"); return true;
         }
         catch (Exception ex) { ShowError("保存失败：" + ex.Message); return false; }
@@ -394,7 +409,7 @@ public partial class RhythmGame : Control
         if (editorPlaying) { Toast("请先暂停播放，再编辑音符。"); return; }
         if (mouse.ButtonIndex == MouseButton.Right)
         {
-            var note = Chart.Notes.Where(n => n.Lane == lane && view.TimeAt(mouse.Position.Y) >= n.Time - 12 / PixelsPerSecond && view.TimeAt(mouse.Position.Y) <= n.Time + n.Duration + 12 / PixelsPerSecond)
+            var note = Chart.Notes.Where(n => n.Lane == lane && view.TimeAt(mouse.Position.Y) >= n.Time - 12 / view.PixelsPerSecond && view.TimeAt(mouse.Position.Y) <= n.Time + n.Duration + 12 / view.PixelsPerSecond)
                 .OrderBy(n => Math.Abs(n.Time - time)).FirstOrDefault();
             if (note != null) { History(); Chart.Notes.Remove(note); MarkDirty(); }
         }
@@ -409,8 +424,14 @@ public partial class RhythmGame : Control
     private void ToggleEditorPlayback()
     {
         if (audio.Stream == null) { ShowError("请先导入音乐。"); return; }
-        if (editorPlaying) { Cursor = AudioTime(); audio.Stop(); editorPlaying = false; }
-        else { if (Cursor >= SongLength - .02) Cursor = 0; audio.Play((float)Cursor); audioEnded = false; editorPlaying = true; }
+        if (editorPlaying) { Cursor = AudioTime(); PlayEditorHitsThrough(Cursor); audio.Stop(); hitSounds.StopAll(); editorPlaying = false; }
+        else
+        {
+            if (Cursor >= SongLength - .02) { Cursor = 0; editorIncludeStart = true; }
+            PrepareEditorHits(Cursor, editorIncludeStart);
+            editorIncludeStart = false;
+            audio.Play((float)Cursor); audioEnded = false; editorPlaying = true;
+        }
         dragStart = -1; dragLane = -1; UpdateEditorLabels();
     }
 
@@ -419,9 +440,33 @@ public partial class RhythmGame : Control
     private void SeekEditor(double time)
     {
         Cursor = Math.Clamp(time, 0, SongLength);
+        audioEnded = false;
+        editorIncludeStart = true;
+        hitSounds.StopAll();
+        PrepareEditorHits(Cursor, true);
+        if (editorPlaying) editorIncludeStart = false;
         dragStart = -1; dragLane = -1;
         if (editorPlaying) { if (Cursor >= SongLength) { audio.Stop(); editorPlaying = false; } else audio.Play((float)Cursor); }
         UpdateEditorLabels();
+    }
+
+    private void PrepareEditorHits(double time, bool includeStart)
+    {
+        editorHitTimes = Chart.Notes.SelectMany(n => n.Duration > 0
+            ? new[] { n.Time, n.Time + n.Duration } : new[] { n.Time }).OrderBy(t => t).ToList();
+        nextEditorHit = 0;
+        while (nextEditorHit < editorHitTimes.Count && (includeStart
+                   ? editorHitTimes[nextEditorHit] < time - .000001
+                   : editorHitTimes[nextEditorHit] <= time + .000001)) nextEditorHit++;
+    }
+
+    private void PlayEditorHitsThrough(double time)
+    {
+        while (nextEditorHit < editorHitTimes.Count && editorHitTimes[nextEditorHit] <= time + .000001)
+        {
+            hitSounds.PlayHit();
+            nextEditorHit++;
+        }
     }
 
     private void UpdateEditorLabels()
@@ -454,6 +499,8 @@ public partial class RhythmGame : Control
         left.AddChild(Text("D / F / J / K", 29));
         left.AddChild(Text("音符到达底部判定线时按键\n长条持续按住直到尾部\nEsc 暂停 / 继续", 16, Muted));
         left.AddChild(Text("PERFECT   ±50 ms\nGREAT     ±100 ms\nGOOD      ±160 ms", 16, Muted));
+        left.AddChild(SoundControls(true));
+        left.AddChild(SpeedControls());
         gameBody.AddChild(left);
         track = new TrackView { Game = this, SizeFlagsHorizontal = SizeFlags.ExpandFill, SizeFlagsVertical = SizeFlags.ExpandFill, ClipContents = true };
         gameBody.AddChild(track);
@@ -482,6 +529,7 @@ public partial class RhythmGame : Control
     {
         if (KeysDown[lane]) return;
         KeysDown[lane] = true;
+        hitSounds.PlayHit();
         int candidate = -1; double best = .160001;
         for (int i = 0; i < Chart.Notes.Count; i++)
         {
@@ -504,6 +552,7 @@ public partial class RhythmGame : Control
             if (NoteStates[i] != 1 || Chart.Notes[i].Lane != lane) continue;
             bool completed = Cursor >= Chart.Notes[i].Time + Chart.Notes[i].Duration - .13;
             NoteStates[i] = completed ? 2 : 3; Judge(completed ? 0 : 3);
+            if (completed) hitSounds.PlayHit();
         }
     }
 
@@ -559,8 +608,8 @@ public partial class RhythmGame : Control
         JudgementLife = Math.Max(0, JudgementLife - (float)delta);
         if (Current == Screen.Editor)
         {
-            if (editorPlaying) Cursor = AudioTime();
-            else if (audioEnded) { Cursor = SongLength; audioEnded = false; }
+            if (editorPlaying) { Cursor = AudioTime(); PlayEditorHitsThrough(Cursor); }
+            else if (audioEnded) { Cursor = SongLength; PlayEditorHitsThrough(Cursor); audioEnded = false; }
             UpdateEditorLabels();
         }
         if (Current == Screen.Playing && !paused)
@@ -580,7 +629,7 @@ public partial class RhythmGame : Control
                 {
                     NoteStates[i] = 3; Judge(3); if (n.Duration > 0) Judge(3);
                 }
-                else if (NoteStates[i] == 1 && Cursor >= n.Time + n.Duration) { NoteStates[i] = 2; Judge(0); }
+                else if (NoteStates[i] == 1 && Cursor >= n.Time + n.Duration) { NoteStates[i] = 2; Judge(0); hitSounds.PlayHit(); }
             }
             statsLabel.Text = $"SCORE\n{Score:D7}\n\nACCURACY\n{Accuracy:0.00}%\n\nCOMBO\n{combo}\n\n{FormatTime(Math.Max(0, Cursor))} / {FormatTime(SongLength)}";
             if (Cursor >= Math.Max(SongLength, Chart.Notes.Max(n => n.Time + n.Duration)) + .5) ShowResults();
@@ -616,6 +665,33 @@ public partial class RhythmGame : Control
     {
         if (Current != Screen.Editor || !dirty) { action(); return; }
         confirmedAction = action; confirm.PopupCentered(new Vector2I(500, 190));
+    }
+
+    private Control SoundControls(bool vertical = false)
+    {
+        BoxContainer controls = vertical ? new VBoxContainer() : new HBoxContainer();
+        controls.AddChild(Text("全局打击音效", 14, Muted));
+        var style = new OptionButton { FocusMode = FocusModeEnum.None, CustomMinimumSize = new Vector2(155, 38) };
+        style.AddItem("方块咔嗒"); style.AddItem("清脆点击"); style.AddItem("低沉 Pu"); style.Selected = hitSounds.Style;
+        style.ItemSelected += index => { hitSounds.Style = (int)index; SaveUserSettings(); hitSounds.PlayHit(); };
+        controls.AddChild(style);
+        var volume = new HSlider { MinValue = 0, MaxValue = 100, Step = 1, Value = hitSounds.Volume * 100, CustomMinimumSize = new Vector2(120, 28), FocusMode = FocusModeEnum.None, TooltipText = "打击音量，调至 0 静音" };
+        volume.ValueChanged += value => { hitSounds.Volume = (float)value / 100; SaveUserSettings(); };
+        controls.AddChild(volume);
+        return controls;
+    }
+
+    private Control SpeedControls()
+    {
+        var controls = new VBoxContainer { TooltipText = "全局设置 · 1×：顶部到底部 1 秒；2×：0.5 秒。编辑器、游玩和试玩共用。" };
+        AddNumber(controls, "全局下落速率（×）", .2, 3, .1, ScrollRate, value => { settings.ScrollRate = value; SaveUserSettings(); });
+        return controls;
+    }
+
+    private void SaveUserSettings()
+    {
+        try { settings.Save(UserSettingsPath); }
+        catch (Exception ex) { ShowError(ex.Message); }
     }
     private void ShowError(string message) { error.DialogText = message; error.PopupCentered(new Vector2I(620, 200)); }
     private void Toast(string message) { if (toastLife <= 0) toast = status.Text; status.Text = message; toastLife = 4; }
