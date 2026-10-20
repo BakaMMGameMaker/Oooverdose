@@ -10,9 +10,16 @@ namespace Oooverdose;
 public sealed class ChartNote
 {
     public int Lane { get; set; }
+    public int EditTrackId { get; set; } = 1;
     public double Time { get; set; }
     public double Duration { get; set; }
-    public ChartNote Copy() => new() { Lane = Lane, Time = Time, Duration = Duration };
+    public ChartNote Copy() => new() { Lane = Lane, EditTrackId = EditTrackId, Time = Time, Duration = Duration };
+}
+
+public sealed class EditTrack
+{
+    public int Id { get; set; } = 1;
+    public string Name { get; set; } = "轨道 1";
 }
 
 public sealed class ChartData
@@ -25,6 +32,8 @@ public sealed class ChartData
     // The time, in seconds, of beat zero in the audio file.
     public double Offset { get; set; }
     public List<ChartNote> Notes { get; set; } = new();
+    public List<EditTrack> EditTracks { get; set; } = new() { new EditTrack() };
+    public List<JudgeLineKey> JudgeLineKeys { get; set; } = new();
     public bool IsDemo { get; set; }
 }
 
@@ -59,27 +68,6 @@ public static class ChartStore
             }
             catch (Exception ex) { GD.PushWarning($"无法读取谱面 {file}: {ex.Message}"); }
         }
-        // Older versions silently forked the built-in chart whenever it was saved.
-        // Only consolidate identical demo-audio charts; preserve every different edit.
-        foreach (var group in charts.Where(c => c.IsDemo && string.IsNullOrEmpty(c.MusicPath))
-                     .GroupBy(c => JsonSerializer.Serialize(new { c.Title, c.Artist, c.Bpm, c.Offset, c.Notes }))
-                     .Where(g => g.Count() > 1).ToList())
-        {
-            var keep = group.OrderBy(c => c.Id == DemoId ? 0 : 1).ThenBy(c => c.Id, StringComparer.Ordinal).First();
-            foreach (var duplicate in group.Where(c => c != keep))
-            {
-                try
-                {
-                    string backupFolder = Path.Combine(Root, "duplicate-backups");
-                    Directory.CreateDirectory(backupFolder);
-                    // Unique backup names preserve previous backups, too.
-                    File.Move(Path.Combine(Root, duplicate.Id + ".json"),
-                        Path.Combine(backupFolder, duplicate.Id + "-" + Guid.NewGuid().ToString("N") + ".json"));
-                    charts.Remove(duplicate);
-                }
-                catch (Exception ex) { GD.PushWarning($"重复谱面备份失败：{ex.Message}"); }
-            }
-        }
         return charts.OrderBy(c => c.IsDemo ? 0 : 1).ThenBy(c => c.Title).ToList();
     }
 
@@ -89,7 +77,17 @@ public static class ChartStore
         if (!double.IsFinite(chart.Bpm) || chart.Bpm < 20 || chart.Bpm > 400) throw new InvalidDataException("BPM 必须在 20–400 之间。");
         if (!double.IsFinite(chart.Offset) || Math.Abs(chart.Offset) > 3600) throw new InvalidDataException("偏移值无效。");
         if (chart.Notes == null || chart.Notes.Count > 100000) throw new InvalidDataException("谱面音符数据无效。");
-        if (chart.Notes.Any(n => n == null || n.Lane < 0 || n.Lane > 3 || !double.IsFinite(n.Time) || !double.IsFinite(n.Duration) || n.Time < 0 || n.Duration < 0 || n.Time + n.Duration > 86400))
+        if (chart.EditTracks == null || chart.EditTracks.Count == 0 || chart.EditTracks.Count > 256 ||
+            chart.EditTracks.Any(t => t == null || t.Id < 1 || string.IsNullOrWhiteSpace(t.Name)) ||
+            chart.EditTracks.Select(t => t.Id).Distinct().Count() != chart.EditTracks.Count)
+            throw new InvalidDataException("编辑轨道数据无效。");
+        var editTrackIds = chart.EditTracks.Select(t => t.Id).ToHashSet();
+        if (chart.JudgeLineKeys == null || chart.JudgeLineKeys.Count > 100000 || chart.JudgeLineKeys.Any(k => k == null ||
+            !double.IsFinite(k.Time) || k.Time < 0 || k.Time > 86400 || !double.IsFinite(k.Y) || k.Y < 0 || k.Y > 100 || !Enum.IsDefined(k.Transition)) ||
+            chart.JudgeLineKeys.Select(k => k.Time).Distinct().Count() != chart.JudgeLineKeys.Count)
+            throw new InvalidDataException("判定线关键帧数据无效。");
+        chart.JudgeLineKeys = chart.JudgeLineKeys.OrderBy(k => k.Time).ToList();
+        if (chart.Notes.Any(n => n == null || !editTrackIds.Contains(n.EditTrackId) || n.Lane < 0 || n.Lane > 3 || !double.IsFinite(n.Time) || !double.IsFinite(n.Duration) || n.Time < 0 || n.Duration < 0 || n.Time + n.Duration > 86400))
             throw new InvalidDataException("谱面包含无效音符。");
         chart.Notes = chart.Notes.OrderBy(n => n.Time).ThenBy(n => n.Lane).ToList();
     }

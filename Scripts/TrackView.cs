@@ -8,22 +8,64 @@ public partial class TrackView : Control
 {
     public RhythmGame Game { get; set; } = null!;
     public bool Decorative { get; set; }
-    public float JudgeY => Size.Y - 76;
+    private PanelContainer? idleHint;
+    private double hintIdleSeconds;
+    private bool pointerInside;
+    public bool EditorHintVisible => idleHint?.Visible == true;
+    public float JudgeY => Size.Y * (float)(Game.JudgeLineY / 100);
+    public Transform2D JudgeTransform => new(0, new Vector2(0, JudgeY));
     // Use the complete visible track height, including the area below the hit line.
-    public double PixelsPerSecond => Math.Max(1, Size.Y) * Game.ScrollRate;
+    public double PixelsPerSecond => Math.Max(1, Size.Y);
     private float Left => Math.Max(52, (Size.X - 520) / 2);
     private float Width => Math.Min(520, Size.X - Left - 24);
     private float LaneWidth => Width / 4;
     private Font Font => ThemeDB.FallbackFont;
     public int LaneAt(float x) => x < Left || x >= Left + Width ? -1 : (int)((x - Left) / LaneWidth);
-    public double TimeAt(float y) => Game.Cursor + (JudgeY - y) / PixelsPerSecond;
-    public float Y(double time) => JudgeY - (float)((time - Game.Cursor) * PixelsPerSecond);
+    public double TimeAt(float y) => Game.Cursor - (JudgeTransform.AffineInverse() * new Vector2(0, y)).Y / PixelsPerSecond;
+    public float Y(double time) => (JudgeTransform * new Vector2(0, (float)JudgeLineAnimation.LocalNoteY(time, Game.Cursor, PixelsPerSecond))).Y;
 
     public override void _Ready()
     {
         MouseFilter = Decorative ? MouseFilterEnum.Ignore : MouseFilterEnum.Stop;
         GuiInput += input => Game.TrackInput(input, this);
         MouseDefaultCursorShape = Decorative ? CursorShape.Arrow : CursorShape.Cross;
+        if (!Decorative && !string.IsNullOrEmpty(TooltipText))
+        {
+            string hintText = TooltipText;
+            // Native tooltips can remain open while moving inside a large Control.
+            // This canvas hint explicitly dismisses on any motion and restarts idle time.
+            TooltipText = "";
+            idleHint = new PanelContainer { Name = "EditorIdleHint", Visible = false, MouseFilter = MouseFilterEnum.Ignore, ZIndex = 100 };
+            idleHint.AddThemeStyleboxOverride("panel", new StyleBoxFlat { BgColor = new Color("08111fee"),
+                ContentMarginLeft = 10, ContentMarginRight = 10, ContentMarginTop = 6, ContentMarginBottom = 6,
+                CornerRadiusTopLeft = 5, CornerRadiusTopRight = 5, CornerRadiusBottomLeft = 5, CornerRadiusBottomRight = 5 });
+            var hintLabel = new Label { Text = hintText, CustomMinimumSize = new Vector2(320, 0), AutowrapMode = TextServer.AutowrapMode.WordSmart, MouseFilter = MouseFilterEnum.Ignore };
+            hintLabel.AddThemeFontSizeOverride("font_size", 14);
+            idleHint.AddChild(hintLabel); AddChild(idleHint);
+            MouseEntered += () => { pointerInside = true; DismissEditorHint(); };
+            MouseExited += () => { pointerInside = false; DismissEditorHint(); };
+            VisibilityChanged += DismissEditorHint;
+        }
+    }
+
+    private void DismissEditorHint() { hintIdleSeconds = 0; idleHint?.Hide(); }
+
+    public override void _Input(InputEvent input)
+    {
+        if (input is InputEventMouseMotion or InputEventMouseButton) DismissEditorHint();
+    }
+
+    public override void _Process(double delta)
+    {
+        if (idleHint == null) return;
+        if (!pointerInside || !IsVisibleInTree() || Game.Current != RhythmGame.Screen.Editor ||
+            Input.IsMouseButtonPressed(MouseButton.Left) || Input.IsMouseButtonPressed(MouseButton.Right)) { DismissEditorHint(); return; }
+        hintIdleSeconds += delta;
+        if (hintIdleSeconds < .65) return;
+        idleHint.Show(); idleHint.Size = idleHint.GetCombinedMinimumSize();
+        var mouse = GetLocalMousePosition();
+        idleHint.Position = new Vector2(Math.Clamp(mouse.X + 14, 8, Math.Max(8, Size.X - idleHint.Size.X - 8)),
+            Math.Clamp(mouse.Y + 22, 8, Math.Max(8, Size.Y - idleHint.Size.Y - 8)));
     }
 
     public override void _Draw()
@@ -46,43 +88,37 @@ public partial class TrackView : Control
         }
         DrawLine(new Vector2(Left + Width, 0), new Vector2(Left + Width, Size.Y), new Color("27364e"));
         DrawGrid(editor);
+        // Inactive edit tracks are painted first so they cannot cover the active notes.
+        for (int pass = 0; pass < (editor ? 2 : 1); pass++)
         for (int i = Game.Chart.Notes.Count - 1; i >= 0; i--)
         {
             var note = Game.Chart.Notes[i];
+            bool dim = editor && !Game.IsCurrentEditTrack(note);
+            if (editor && dim != (pass == 0)) continue;
             int state = !editor && i < Game.NoteStates.Length ? Game.NoteStates[i] : 0;
             if (!editor && state >= 2) continue;
             float head = state == 1 ? JudgeY : Y(note.Time);
             float tail = Y(note.Time + note.Duration);
             if (tail > Size.Y + 30 || head < -30) continue;
-            DrawNote(note.Lane, head, tail, note.Duration > 0, state == 1);
+            DrawNote(note.Lane, head, tail, note.Duration > 0, state == 1, dim);
         }
         if (editor && Game.DragLane >= 0)
         {
             double start = Math.Min(Game.DragStart, Game.DragEnd), end = Math.Max(Game.DragStart, Game.DragEnd);
             DrawNote(Game.DragLane, Y(start), Y(end), end > start, true);
         }
-        DrawRect(new Rect2(Left, JudgeY + 7, Width, Size.Y - JudgeY - 7), new Color("0a1220"));
         DrawLine(new Vector2(Left - 8, JudgeY), new Vector2(Left + Width + 8, JudgeY), RhythmGame.Cyan, 3, true);
-        DrawString(Font, new Vector2(Left - 39, JudgeY + 5), editor ? "NOW" : "HIT", HorizontalAlignment.Left, -1, 12, RhythmGame.Cyan);
-        string[] keys = { "D", "F", "J", "K" };
-        for (int lane = 0; lane < 4; lane++)
-        {
-            float x = Left + lane * LaneWidth;
-            var color = RhythmGame.LaneColors[lane];
-            DrawStyleBox(KeyBox(!editor && Game.KeysDown[lane] ? new Color(color, .3f) : new Color("17263a"), color), new Rect2(x + 12, JudgeY + 20, LaneWidth - 24, 37));
-            DrawString(Font, new Vector2(x, JudgeY + 47), keys[lane], HorizontalAlignment.Center, LaneWidth, 23, color);
-        }
-        DrawString(Font, new Vector2(Left + 12, 24), editor ? "CHART / 4K" : "OOOVERDOSE / 4K", HorizontalAlignment.Left, -1, 13, RhythmGame.Muted);
+        DrawString(Font, new Vector2(Left - 39, Math.Clamp(JudgeY + 5, 14, Size.Y - 4)), editor ? "NOW" : "HIT", HorizontalAlignment.Left, -1, 12, RhythmGame.Cyan);
         if (!editor && Game.JudgementLife > 0)
         {
             Color color = Game.Judgement == "MISS" ? new Color("ff7f98") : RhythmGame.Cyan;
-            DrawString(Font, new Vector2(Left, JudgeY - 122), Game.Judgement, HorizontalAlignment.Center, Width, 34, color);
+            DrawString(Font, new Vector2(Left, Math.Clamp(JudgeY - 122, 70, Size.Y - 65)), Game.Judgement, HorizontalAlignment.Center, Width, 34, color);
         }
         if (editor)
         {
             var mouse = GetLocalMousePosition();
             int lane = LaneAt(mouse.X);
-            if (lane >= 0 && mouse.Y >= 30 && mouse.Y <= JudgeY)
+            if (lane >= 0 && mouse.Y >= 30 && mouse.Y <= Size.Y)
             {
                 float y = Y(Game.Snap(TimeAt(mouse.Y)));
                 DrawRect(new Rect2(Left + lane * LaneWidth + 8, y - 6, LaneWidth - 16, 12), new Color(RhythmGame.LaneColors[lane], .3f));
@@ -91,16 +127,11 @@ public partial class TrackView : Control
         }
     }
 
-    private static StyleBoxFlat KeyBox(Color background, Color border) => new()
-    {
-        BgColor = background, BorderColor = new Color(border, .55f), BorderWidthBottom = 2,
-        CornerRadiusTopLeft = 5, CornerRadiusTopRight = 5, CornerRadiusBottomLeft = 5, CornerRadiusBottomRight = 5
-    };
-
     private void DrawGrid(bool editor)
     {
         double beatTime = 60 / Game.Chart.Bpm;
-        double step = editor ? beatTime * 4 / Game.SnapDivision : beatTime;
+        int division = editor ? Game.SnapDivision : 4;
+        double step = BeatGrid.Step(Game.Chart.Bpm, division);
         double start = Game.Cursor + (JudgeY - Size.Y) / PixelsPerSecond;
         double end = Game.Cursor + JudgeY / PixelsPerSecond;
         long first = (long)Math.Floor((start - Game.Chart.Offset) / step);
@@ -108,7 +139,7 @@ public partial class TrackView : Control
         // Even the finest subdivision is bounded to a few thousand lines per frame.
         for (long tick = first; tick <= last; tick++)
         {
-            double time = Game.Chart.Offset + tick * step;
+            double time = BeatGrid.Time(tick, Game.Chart.Bpm, Game.Chart.Offset, division);
             if (time < 0 || time > Game.SongLength) continue;
             double beat = (time - Game.Chart.Offset) / beatTime;
             bool fullBeat = Math.Abs(beat - Math.Round(beat)) < .00001;
@@ -120,23 +151,24 @@ public partial class TrackView : Control
         }
     }
 
-    private void DrawNote(int lane, float head, float tail, bool hold, bool active)
+    private void DrawNote(int lane, float head, float tail, bool hold, bool active, bool dim = false)
     {
         float x = Left + LaneWidth * lane + 8, width = LaneWidth - 16;
-        var color = RhythmGame.LaneColors[lane];
+        float opacity = dim ? .4f : 1;
+        var color = new Color(dim ? RhythmGame.LaneColors[lane].Darkened(.4f) : RhythmGame.LaneColors[lane], opacity);
         if (hold)
         {
             float top = Math.Max(-12, tail), bottom = Math.Min(Size.Y + 12, head);
             if (bottom > top)
             {
-                DrawRect(new Rect2(x + 8, top, width - 16, bottom - top), new Color(color, active ? .55f : .27f));
-                DrawLine(new Vector2(x + width / 2, top), new Vector2(x + width / 2, bottom), new Color(color, .8f), 2);
+                DrawRect(new Rect2(x + 8, top, width - 16, bottom - top), new Color(color, (active ? .55f : .27f) * opacity));
+                DrawLine(new Vector2(x + width / 2, top), new Vector2(x + width / 2, bottom), new Color(color, .8f * opacity), 2);
             }
             DrawRect(new Rect2(x + 4, tail - 4, width - 8, 8), color);
         }
-        DrawRect(new Rect2(x - 2, head - 9, width + 4, 18), new Color(color, .12f));
+        DrawRect(new Rect2(x - 2, head - 9, width + 4, 18), new Color(color, .12f * opacity));
         DrawRect(new Rect2(x, head - 6, width, 12), color);
-        DrawRect(new Rect2(x + 2, head - 6, width - 4, 3), new Color(Colors.White, .65f));
+        DrawRect(new Rect2(x + 2, head - 6, width - 4, 3), new Color(dim ? color : Colors.White, .65f * opacity));
     }
 
     private void DrawDecoration()

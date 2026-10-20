@@ -16,7 +16,6 @@ public partial class RhythmGame : Control
     public double Cursor { get; private set; }
     public double SongLength { get; private set; } = 60;
     private PlayerSettings settings = new();
-    public double ScrollRate => settings.ScrollRate;
     private static string UserSettingsPath => Path.Combine(Path.GetDirectoryName(ChartStore.Root)!, "settings.cfg");
     public int SnapDivision { get; private set; } = 16;
     public bool LongTool { get; private set; }
@@ -32,14 +31,21 @@ public partial class RhythmGame : Control
     private HSlider timeline = null!;
     private TrackView? track;
     private Button playButton = null!, saveButton = null!;
-    private bool libraryEdit, dirty, sliderUpdate, paused, audioStarted, audioEnded;
+    private bool dirty, sliderUpdate, paused, audioStarted, audioEnded;
     private double playbackRate = 1, scoreValue;
     private int combo, maxCombo, perfect, great, good, miss, judgedUnits;
     private bool editorPlaying;
+    public int CurrentEditTrackId { get; private set; } = 1;
+    private string editingChartId = "";
+    private OptionButton? editTrackSelector;
+    private LineEdit? editTrackName;
+    private bool updatingEditTrackUi;
+    public bool IsCurrentEditTrack(ChartNote note) => note.EditTrackId == CurrentEditTrackId;
     private List<double> editorHitTimes = new();
     private int nextEditorHit;
     private bool editorIncludeStart = true;
-    private readonly Stack<List<ChartNote>> undo = new(), redo = new();
+    private sealed record EditorSnapshot(List<ChartNote> Notes, List<JudgeLineKey> Keys);
+    private readonly Stack<EditorSnapshot> undo = new(), redo = new();
     private double dragStart = -1;
     private int dragLane = -1;
     public double DragStart => dragStart;
@@ -71,7 +77,6 @@ public partial class RhythmGame : Control
         try
         {
             if (!File.Exists(Path.Combine(ChartStore.Root, ChartStore.DemoId + ".json"))) ChartStore.Save(ChartStore.DemoChart());
-            ChartStore.LoadAll();
         }
         catch (Exception ex) { ShowError(ex.Message); }
         ShowHome();
@@ -104,7 +109,7 @@ public partial class RhythmGame : Control
         return box;
     }
 
-    private void ResetPage(Screen screen, string section)
+    private void ResetPage(Screen screen, string section = "")
     {
         audio.Stop();
         hitSounds.StopAll();
@@ -112,28 +117,34 @@ public partial class RhythmGame : Control
         editorPlaying = false;
         editorIncludeStart = true;
         Current = screen;
+        hitSounds.Settings = screen == Screen.Editor ? settings.Copy() : settings;
         toastLife = 0;
         dragStart = -1;
         dragLane = -1;
         if (page != null) { RemoveChild(page); page.QueueFree(); }
         track = null;
-        page = new VBoxContainer { OffsetLeft = 36, OffsetTop = 24, OffsetRight = -36, OffsetBottom = -18 };
+        judgeKeyTime = null; judgeKeyY = null; judgeKeyTransition = null; judgeAnimationLabel = null; judgeTimeline = null; SelectedJudgeKey = null;
+        bool compact = screen is Screen.Editor or Screen.Playing;
+        page = new VBoxContainer { OffsetLeft = compact ? 16 : 36, OffsetTop = compact ? 12 : 24, OffsetRight = compact ? -16 : -36, OffsetBottom = compact ? -12 : -18 };
         page.SetAnchorsPreset(LayoutPreset.FullRect);
         AddChild(page);
         MoveChild(page, 0);
-        var header = new HBoxContainer();
-        var brand = Text("◈  OOOVERDOSE", 25, Cyan);
-        header.AddChild(brand);
-        header.AddChild(new Control { SizeFlagsHorizontal = SizeFlags.ExpandFill });
-        header.AddChild(Text(section, 15, Muted));
-        page.AddChild(header);
-        page.AddChild(new HSeparator());
+        if (!compact)
+        {
+            var header = new HBoxContainer();
+            header.AddChild(Text("◈  OOOVERDOSE", 25, Cyan));
+            header.AddChild(new Control { SizeFlagsHorizontal = SizeFlags.ExpandFill });
+            header.AddChild(Text(section, 15, Muted));
+            page.AddChild(header);
+            page.AddChild(new HSeparator());
+        }
         status = Text("", 14, Muted);
     }
 
     private void Footer(string message)
     {
         status.Text = message;
+        status.Visible = !string.IsNullOrEmpty(message);
         page.AddChild(status);
     }
 
@@ -184,7 +195,6 @@ public partial class RhythmGame : Control
         actions.AddChild(start); actions.AddChild(edit); left.AddChild(actions);
         left.AddChild(Text("D / F / J / K   ·   长条请持续按住   ·   Esc 暂停", 16, Muted));
         left.AddChild(SoundControls());
-        left.AddChild(SpeedControls());
         var art = new TrackView { Game = this, Decorative = true, CustomMinimumSize = new Vector2(480, 0), SizeFlagsVertical = SizeFlags.ExpandFill };
         content.AddChild(art);
         Footer("LOCAL MUSIC, YOUR RHYTHM.                                      v1.0  /  GODOT + C#");
@@ -192,7 +202,6 @@ public partial class RhythmGame : Control
 
     private void ShowLibrary(bool edit)
     {
-        libraryEdit = edit;
         ResetPage(Screen.Library, edit ? "CREATE / CHART EDITOR" : "PLAY / SONG SELECT");
         var title = new HBoxContainer();
         var labels = new VBoxContainer { SizeFlagsHorizontal = SizeFlags.ExpandFill };
@@ -230,8 +239,10 @@ public partial class RhythmGame : Control
 
     private void OpenEditor(ChartData chart)
     {
+        if (editingChartId != chart.Id || !chart.EditTracks.Any(t => t.Id == CurrentEditTrackId)) CurrentEditTrackId = chart.EditTracks[0].Id;
+        editingChartId = chart.Id;
         Chart = chart;
-        ResetPage(Screen.Editor, "STUDIO / FOUR LANE CHART EDITOR");
+        ResetPage(Screen.Editor);
         audio.PitchScale = 1;
         audioEnded = false;
         playbackRate = 1;
@@ -239,61 +250,9 @@ public partial class RhythmGame : Control
         dirty = false; undo.Clear(); redo.Clear();
         if (!string.IsNullOrEmpty(chart.MusicPath) || chart.IsDemo) SetAudio(chart);
         else { audio.Stream = null; SongLength = 60; }
-        var toolbar = new HBoxContainer();
-        toolbar.AddChild(Text("谱面编辑器", 28));
-        toolbar.AddChild(new Control { SizeFlagsHorizontal = SizeFlags.ExpandFill });
-        toolbar.AddChild(Button("导入音乐", ImportMusic, true));
-        saveButton = Button("保存谱面  Ctrl+S", SaveChart, true);
-        toolbar.AddChild(saveButton);
-        toolbar.AddChild(Button("试玩", PreviewChart));
-        toolbar.AddChild(Button("返回", () => Guard(() => ShowLibrary(true))));
-        page.AddChild(toolbar);
-        var main = new HBoxContainer { SizeFlagsVertical = SizeFlags.ExpandFill };
-        page.AddChild(main);
-        var inspector = new VBoxContainer { CustomMinimumSize = new Vector2(292, 0) };
-        var sideScroll = new ScrollContainer { CustomMinimumSize = new Vector2(330, 0), HorizontalScrollMode = ScrollContainer.ScrollMode.Disabled };
-        sideScroll.AddChild(inspector); main.AddChild(sideScroll);
-        inspector.AddChild(Text("01 / 曲目信息", 16, Cyan));
-        AddField(inspector, "曲名", Chart.Title, value => { Chart.Title = value; MarkDirty(); });
-        AddField(inspector, "作者 / Artist", Chart.Artist, value => { Chart.Artist = value; MarkDirty(); });
-        AddNumber(inspector, "BPM", 20, 400, .1, Chart.Bpm, v => { Chart.Bpm = v; MarkDirty(); });
-        AddNumber(inspector, "首拍偏移（秒，可为负数）", -3600, 3600, .001, Chart.Offset, v => { Chart.Offset = v; MarkDirty(); });
-        inspector.AddChild(Text("02 / 编辑工具", 16, Cyan));
-        var tools = new OptionButton { CustomMinimumSize = new Vector2(0, 40), FocusMode = FocusModeEnum.None };
-        tools.AddItem("单点 NOTE  ·  左键放置"); tools.AddItem("长条 HOLD  ·  左键拖动");
-        tools.Selected = LongTool ? 1 : 0;
-        tools.ItemSelected += index => LongTool = index == 1;
-        inspector.AddChild(tools);
-        inspector.AddChild(Text("节拍吸附（全音符分母）", 15, Muted));
-        var snap = new OptionButton { CustomMinimumSize = new Vector2(0, 40), FocusMode = FocusModeEnum.None };
-        int[] divisions = { 4, 6, 8, 12, 16, 24, 32, 64, 128 };
-        foreach (var div in divisions) snap.AddItem($"1/{div}  ·  {4.0 / div:0.###} 拍");
-        snap.Selected = Array.IndexOf(divisions, SnapDivision);
-        snap.ItemSelected += index => SnapDivision = divisions[(int)index]; inspector.AddChild(snap);
-        inspector.AddChild(SpeedControls());
-        var history = new HBoxContainer();
-        history.AddChild(Button("撤销", Undo)); history.AddChild(Button("重做", Redo)); inspector.AddChild(history);
-        inspector.AddChild(SoundControls(true));
-        inspector.AddChild(Text("右键：删除音符或长条\n滚轮：移动时间 · Shift：精细移动\nSpace：播放 / 暂停\nCtrl+Z / Ctrl+Y：撤销 / 重做\n编辑时暂停播放，放置更准确。", 14, Muted));
-        var trackPanel = new VBoxContainer { SizeFlagsHorizontal = SizeFlags.ExpandFill };
-        main.AddChild(trackPanel);
-        track = new TrackView { Game = this, SizeFlagsHorizontal = SizeFlags.ExpandFill, SizeFlagsVertical = SizeFlags.ExpandFill, ClipContents = true };
-        trackPanel.AddChild(track);
-        var transport = new HBoxContainer();
-        playButton = Button("▶ 播放", ToggleEditorPlayback); transport.AddChild(playButton);
-        transport.AddChild(Button("↤", () => SeekEditor(0)));
-        var speed = new OptionButton { CustomMinimumSize = new Vector2(120, 40), FocusMode = FocusModeEnum.None };
-        foreach (var rate in new[] { .25, .5, .75, 1.0 }) speed.AddItem($"{rate:0.##} ×");
-        speed.Selected = 3;
-        speed.ItemSelected += index => { playbackRate = new[] { .25, .5, .75, 1.0 }[(int)index]; audio.PitchScale = (float)playbackRate; };
-        transport.AddChild(speed);
-        clockLabel = Text("", 16, Cyan); transport.AddChild(clockLabel);
-        trackPanel.AddChild(transport);
-        timeline = new HSlider { MinValue = 0, MaxValue = SongLength, Step = .001, CustomMinimumSize = new Vector2(0, 28), FocusMode = FocusModeEnum.None };
-        timeline.ValueChanged += value => { if (!sliderUpdate) SeekEditor(value); };
-        trackPanel.AddChild(timeline);
-        Footer("从底部的当前时间线向上摆放未来音符。拖动下方时间轴可定位整首歌曲。");
-        UpdateEditorLabels();
+        BuildEditorLayout();
+        Footer("");
+        SeekEditor(Snap(0));
     }
 
     private void AddField(VBoxContainer parent, string label, string value, Action<string> change)
@@ -320,14 +279,14 @@ public partial class RhythmGame : Control
             {
                 var testChart = new ChartData { MusicPath = path };
                 var stream = ChartStore.LoadAudio(testChart);
-                if (Chart.Notes.Any(n => n.Time + n.Duration > stream.GetLength()))
-                    throw new InvalidDataException("新音乐短于现有谱面的最后一个音符。请先删除超出范围的音符。");
+                if (Chart.Notes.Any(n => n.Time + n.Duration > stream.GetLength()) || Chart.JudgeLineKeys.Any(k => k.Time > stream.GetLength()))
+                    throw new InvalidDataException("新音乐短于现有音符或判定线动画。请先删除超出范围的内容。");
                 Directory.CreateDirectory(Path.Combine(ChartStore.Root, "audio"));
                 string target = Path.Combine(ChartStore.Root, "audio", Guid.NewGuid().ToString("N") + Path.GetExtension(path).ToLowerInvariant());
                 File.Copy(path, target);
                 audio.Stop(); editorPlaying = false; Chart.MusicPath = target; Chart.IsDemo = false;
                 audio.Stream = stream; SongLength = stream.GetLength(); Cursor = 0;
-                timeline.MaxValue = SongLength; MarkDirty(); UpdateEditorLabels();
+                timeline.MaxValue = SongLength; MarkDirty(); SeekEditor(Snap(0));
                 Toast("音乐已导入并复制到谱面库。");
             }
             catch (Exception ex) { ShowError("导入失败：" + ex.Message); }
@@ -337,7 +296,7 @@ public partial class RhythmGame : Control
         picker.PopupCenteredRatio(.75f);
     }
 
-    private void MarkDirty() { dirty = true; editorIncludeStart = true; if (GodotObject.IsInstanceValid(saveButton)) saveButton.Text = "● 保存谱面  Ctrl+S"; }
+    private void MarkDirty() { dirty = true; editorIncludeStart = true; if (GodotObject.IsInstanceValid(saveButton)) saveButton.Text = "● 保存"; }
     private void SaveChart() => SaveChartCore();
     private void PreviewChart() { if (SaveChartCore()) StartGame(Chart, true); }
     private bool SaveChartCore()
@@ -347,33 +306,39 @@ public partial class RhythmGame : Control
             if (audio.Stream == null) throw new InvalidOperationException("请先导入音乐，再保存谱面。");
             if (string.IsNullOrWhiteSpace(Chart.Title)) throw new InvalidOperationException("请填写曲名。");
             if (Chart.Notes.Any(n => n.Time + n.Duration > SongLength + .001)) throw new InvalidOperationException("音符超出了音乐长度。");
+            if (Chart.JudgeLineKeys.Any(k => k.Time > SongLength + .001)) throw new InvalidOperationException("判定线关键帧超出了音乐长度。");
             // Save every existing chart in place, including the bundled example.
-            ChartStore.Save(Chart); dirty = false; saveButton.Text = "保存谱面  Ctrl+S"; Toast("谱面已保存，可在「开始游戏」中选择。"); return true;
+            ChartStore.Save(Chart); dirty = false; saveButton.Text = "保存"; Toast("谱面已保存。"); return true;
         }
         catch (Exception ex) { ShowError("保存失败：" + ex.Message); return false; }
     }
 
-    public double Snap(double time)
+    public double Snap(double time) => BeatGrid.Snap(time, Chart.Bpm, Chart.Offset, SnapDivision, SongLength);
+
+    private void ChangeChartTiming(double bpm, double offset)
     {
-        double step = 60 / Chart.Bpm * 4 / SnapDivision;
-        double beat = Math.Round((time - Chart.Offset) / step, MidpointRounding.AwayFromZero);
-        double snapped = Chart.Offset + beat * step;
-        // Choose a grid point inside the audio instead of creating an off-grid endpoint.
-        if (snapped < 0) snapped += Math.Ceiling(-snapped / step) * step;
-        if (snapped > SongLength) snapped -= Math.Ceiling((snapped - SongLength) / step) * step;
-        return Math.Clamp(snapped, 0, SongLength);
+        Chart.Bpm = bpm; Chart.Offset = offset; MarkDirty();
+        if (!editorPlaying) SeekEditor(Snap(Cursor));
     }
 
-    private void History() { undo.Push(Chart.Notes.Select(n => n.Copy()).ToList()); redo.Clear(); }
+    private void NavigateEditorBeat(int direction, bool fine)
+    {
+        double step = fine ? BeatGrid.Step(Chart.Bpm, SnapDivision) : 60 / Chart.Bpm;
+        double target = BeatGrid.Next(Cursor, step, Chart.Offset, direction);
+        SeekEditor(Snap(Math.Clamp(target, 0, SongLength)));
+    }
+
+    private EditorSnapshot Snapshot() => new(Chart.Notes.Select(n => n.Copy()).ToList(), Chart.JudgeLineKeys.Select(k => k.Copy()).ToList());
+    private void History() { undo.Push(Snapshot()); redo.Clear(); }
     private void Undo()
     {
         if (undo.Count == 0) return;
-        redo.Push(Chart.Notes.Select(n => n.Copy()).ToList()); Chart.Notes = undo.Pop(); MarkDirty();
+        redo.Push(Snapshot()); var state = undo.Pop(); Chart.Notes = state.Notes; Chart.JudgeLineKeys = state.Keys; MarkDirty(); SyncJudgeAnimationFields();
     }
     private void Redo()
     {
         if (redo.Count == 0) return;
-        undo.Push(Chart.Notes.Select(n => n.Copy()).ToList()); Chart.Notes = redo.Pop(); MarkDirty();
+        undo.Push(Snapshot()); var state = redo.Pop(); Chart.Notes = state.Notes; Chart.JudgeLineKeys = state.Keys; MarkDirty(); SyncJudgeAnimationFields();
     }
 
     private bool AddNote(int lane, double start, double end)
@@ -381,8 +346,8 @@ public partial class RhythmGame : Control
         start = Snap(start); end = Snap(end);
         double time = Math.Min(start, end), duration = Math.Abs(end - start);
         bool overlaps = Chart.Notes.Any(n => n.Lane == lane && time <= n.Time + n.Duration + .001 && time + duration >= n.Time - .001);
-        if (overlaps) { Toast("同一轨道的音符不能重叠。"); return false; }
-        History(); Chart.Notes.Add(new ChartNote { Lane = lane, Time = time, Duration = duration });
+        if (overlaps) { Toast("同一按键列的音符不能重叠（包括其他编辑轨道）。"); return false; }
+        History(); Chart.Notes.Add(new ChartNote { Lane = lane, EditTrackId = CurrentEditTrackId, Time = time, Duration = duration });
         Chart.Notes = Chart.Notes.OrderBy(n => n.Time).ThenBy(n => n.Lane).ToList(); MarkDirty(); return true;
     }
 
@@ -391,8 +356,7 @@ public partial class RhythmGame : Control
         if (Current != Screen.Editor) return;
         if (input is InputEventMouseButton wheel && wheel.Pressed && (wheel.ButtonIndex == MouseButton.WheelUp || wheel.ButtonIndex == MouseButton.WheelDown))
         {
-            double step = 60 / Chart.Bpm * (wheel.ShiftPressed ? 4.0 / SnapDivision : 1);
-            SeekEditor(Cursor + (wheel.ButtonIndex == MouseButton.WheelUp ? step : -step));
+            NavigateEditorBeat(wheel.ButtonIndex == MouseButton.WheelUp ? 1 : -1, wheel.ShiftPressed);
             view.AcceptEvent(); return;
         }
         if (input is InputEventMouseMotion motion && dragLane >= 0) DragEnd = Snap(view.TimeAt(motion.Position.Y));
@@ -403,13 +367,13 @@ public partial class RhythmGame : Control
             dragStart = -1; dragLane = -1; view.AcceptEvent(); return;
         }
         int lane = view.LaneAt(mouse.Position.X);
-        if (lane < 0 || mouse.Position.Y > view.JudgeY || mouse.Position.Y < 30) return;
+        if (lane < 0 || mouse.Position.Y > view.Size.Y || mouse.Position.Y < 30) return;
         double time = Snap(view.TimeAt(mouse.Position.Y));
         if (!mouse.Pressed) return;
         if (editorPlaying) { Toast("请先暂停播放，再编辑音符。"); return; }
         if (mouse.ButtonIndex == MouseButton.Right)
         {
-            var note = Chart.Notes.Where(n => n.Lane == lane && view.TimeAt(mouse.Position.Y) >= n.Time - 12 / view.PixelsPerSecond && view.TimeAt(mouse.Position.Y) <= n.Time + n.Duration + 12 / view.PixelsPerSecond)
+            var note = Chart.Notes.Where(n => IsCurrentEditTrack(n) && n.Lane == lane && view.TimeAt(mouse.Position.Y) >= n.Time - 12 / view.PixelsPerSecond && view.TimeAt(mouse.Position.Y) <= n.Time + n.Duration + 12 / view.PixelsPerSecond)
                 .OrderBy(n => Math.Abs(n.Time - time)).FirstOrDefault();
             if (note != null) { History(); Chart.Notes.Remove(note); MarkDirty(); }
         }
@@ -424,7 +388,7 @@ public partial class RhythmGame : Control
     private void ToggleEditorPlayback()
     {
         if (audio.Stream == null) { ShowError("请先导入音乐。"); return; }
-        if (editorPlaying) { Cursor = AudioTime(); PlayEditorHitsThrough(Cursor); audio.Stop(); hitSounds.StopAll(); editorPlaying = false; }
+        if (editorPlaying) { Cursor = AudioTime(); PlayEditorHitsThrough(Cursor); audio.Stop(); hitSounds.StopAll(); editorPlaying = false; SeekEditor(Snap(Cursor)); }
         else
         {
             if (Cursor >= SongLength - .02) { Cursor = 0; editorIncludeStart = true; }
@@ -432,7 +396,7 @@ public partial class RhythmGame : Control
             editorIncludeStart = false;
             audio.Play((float)Cursor); audioEnded = false; editorPlaying = true;
         }
-        dragStart = -1; dragLane = -1; UpdateEditorLabels();
+        dragStart = -1; dragLane = -1; UpdateEditorLabels(); SyncJudgeAnimationFields();
     }
 
     private double AudioTime() => Math.Clamp(audio.GetPlaybackPosition() + AudioServer.GetTimeSinceLastMix() * playbackRate - AudioServer.GetOutputLatency() * playbackRate, 0, SongLength);
@@ -448,11 +412,12 @@ public partial class RhythmGame : Control
         dragStart = -1; dragLane = -1;
         if (editorPlaying) { if (Cursor >= SongLength) { audio.Stop(); editorPlaying = false; } else audio.Play((float)Cursor); }
         UpdateEditorLabels();
+        SyncJudgeAnimationFields();
     }
 
     private void PrepareEditorHits(double time, bool includeStart)
     {
-        editorHitTimes = Chart.Notes.SelectMany(n => n.Duration > 0
+        editorHitTimes = Chart.Notes.Where(IsCurrentEditTrack).SelectMany(n => n.Duration > 0
             ? new[] { n.Time, n.Time + n.Duration } : new[] { n.Time }).OrderBy(t => t).ToList();
         nextEditorHit = 0;
         while (nextEditorHit < editorHitTimes.Count && (includeStart
@@ -472,8 +437,48 @@ public partial class RhythmGame : Control
     private void UpdateEditorLabels()
     {
         playButton.Text = editorPlaying ? "Ⅱ 暂停" : "▶ 播放";
-        clockLabel.Text = $"{FormatTime(Cursor)} / {FormatTime(SongLength)}   ·   {Chart.Notes.Count} NOTES";
+        clockLabel.Text = $"{FormatTime(Cursor)} / {FormatTime(SongLength)}   ·   {Chart.Notes.Count(IsCurrentEditTrack)} / {Chart.Notes.Count} NOTES";
         sliderUpdate = true; timeline.Value = Cursor; sliderUpdate = false;
+    }
+
+    private void RefreshEditTrackUi()
+    {
+        updatingEditTrackUi = true;
+        editTrackSelector!.Clear();
+        foreach (var editTrack in Chart.EditTracks) editTrackSelector.AddItem($"{editTrack.Id} · {editTrack.Name}");
+        editTrackSelector.Select(Chart.EditTracks.FindIndex(t => t.Id == CurrentEditTrackId));
+        editTrackName!.Text = Chart.EditTracks.First(t => t.Id == CurrentEditTrackId).Name;
+        updatingEditTrackUi = false;
+    }
+
+    private void CreateEditTrack()
+    {
+        if (Chart.EditTracks.Count >= 256) { Toast("最多支持 256 个编辑轨道。"); return; }
+        int id = Enumerable.Range(1, Chart.EditTracks.Count + 1).First(id => Chart.EditTracks.All(t => t.Id != id));
+        Chart.EditTracks.Add(new EditTrack { Id = id, Name = $"轨道 {id}" });
+        MarkDirty(); SelectEditTrack(id);
+    }
+
+    private void SelectEditTrack(int id)
+    {
+        if (updatingEditTrackUi || !Chart.EditTracks.Any(t => t.Id == id)) return;
+        CurrentEditTrackId = id;
+        dragStart = -1; dragLane = -1;
+        hitSounds.StopAll();
+        if (editorPlaying) Cursor = AudioTime();
+        // Do not replay the elapsed section when switching instruments during playback.
+        PrepareEditorHits(Cursor, !editorPlaying);
+        editorIncludeStart = !editorPlaying;
+        RefreshEditTrackUi();
+    }
+
+    private void RenameEditTrack(string name)
+    {
+        if (updatingEditTrackUi) return;
+        var editTrack = Chart.EditTracks.First(t => t.Id == CurrentEditTrackId);
+        editTrack.Name = string.IsNullOrWhiteSpace(name) ? $"轨道 {editTrack.Id}" : name;
+        editTrackSelector!.SetItemText(Chart.EditTracks.IndexOf(editTrack), $"{editTrack.Id} · {editTrack.Name}");
+        MarkDirty();
     }
 
     private bool fromEditor;
@@ -483,7 +488,7 @@ public partial class RhythmGame : Control
         if (!SetAudio(chart)) return;
         if (chart.Notes.Count == 0) { ShowError("这个谱面还没有音符，请先在编辑器中放置音符。"); return; }
         Chart = chart; fromEditor = preview;
-        ResetPage(Screen.Playing, "PLAY / D · F · J · K");
+        ResetPage(Screen.Playing);
         audio.PitchScale = 1; playbackRate = 1;
         Cursor = -2.5; combo = maxCombo = perfect = great = good = miss = judgedUnits = 0; scoreValue = 0;
         NoteStates = new int[chart.Notes.Count]; Array.Fill(KeysDown, false);
@@ -500,7 +505,6 @@ public partial class RhythmGame : Control
         left.AddChild(Text("音符到达底部判定线时按键\n长条持续按住直到尾部\nEsc 暂停 / 继续", 16, Muted));
         left.AddChild(Text("PERFECT   ±50 ms\nGREAT     ±100 ms\nGOOD      ±160 ms", 16, Muted));
         left.AddChild(SoundControls(true));
-        left.AddChild(SpeedControls());
         gameBody.AddChild(left);
         track = new TrackView { Game = this, SizeFlagsHorizontal = SizeFlags.ExpandFill, SizeFlagsVertical = SizeFlags.ExpandFill, ClipContents = true };
         gameBody.AddChild(track);
@@ -604,13 +608,14 @@ public partial class RhythmGame : Control
 
     public override void _Process(double delta)
     {
-        if (toastLife > 0) { toastLife -= delta; if (toastLife <= 0 && GodotObject.IsInstanceValid(status)) status.Text = toast; }
+        if (toastLife > 0) { toastLife -= delta; if (toastLife <= 0 && GodotObject.IsInstanceValid(status)) { status.Text = toast; status.Visible = !string.IsNullOrEmpty(toast); } }
         JudgementLife = Math.Max(0, JudgementLife - (float)delta);
         if (Current == Screen.Editor)
         {
-            if (editorPlaying) { Cursor = AudioTime(); PlayEditorHitsThrough(Cursor); }
-            else if (audioEnded) { Cursor = SongLength; PlayEditorHitsThrough(Cursor); audioEnded = false; }
+            if (editorPlaying) { Cursor = AudioTime(); PlayEditorHitsThrough(Cursor); SyncJudgeAnimationFields(); }
+            else if (audioEnded) { Cursor = SongLength; PlayEditorHitsThrough(Cursor); audioEnded = false; SyncJudgeAnimationFields(); }
             UpdateEditorLabels();
+            UpdateJudgeAnimator();
         }
         if (Current == Screen.Playing && !paused)
         {
@@ -650,6 +655,7 @@ public partial class RhythmGame : Control
         }
         if (textFocused) return;
         if (Current == Screen.Editor && key.Pressed && code == Key.Space) { ToggleEditorPlayback(); GetViewport().SetInputAsHandled(); }
+        if (Current == Screen.Editor && key.Pressed && code == Key.K) { CommitJudgeKey(); GetViewport().SetInputAsHandled(); }
         if (Current == Screen.Playing)
         {
             if (key.Pressed && code == Key.Escape) { TogglePause(); GetViewport().SetInputAsHandled(); return; }
@@ -669,22 +675,17 @@ public partial class RhythmGame : Control
 
     private Control SoundControls(bool vertical = false)
     {
+        bool temporary = Current == Screen.Editor;
+        var soundSettings = hitSounds.Settings;
         BoxContainer controls = vertical ? new VBoxContainer() : new HBoxContainer();
-        controls.AddChild(Text("全局打击音效", 14, Muted));
+        controls.AddChild(Text(temporary ? "编辑器试听音效（临时）" : "全局打击音效", 14, Muted));
         var style = new OptionButton { FocusMode = FocusModeEnum.None, CustomMinimumSize = new Vector2(155, 38) };
         style.AddItem("方块咔嗒"); style.AddItem("清脆点击"); style.AddItem("低沉 Pu"); style.Selected = hitSounds.Style;
-        style.ItemSelected += index => { hitSounds.Style = (int)index; SaveUserSettings(); hitSounds.PlayHit(); };
+        style.ItemSelected += index => { soundSettings.HitSoundStyle = (int)index; if (!temporary) SaveUserSettings(); hitSounds.PlayHit(); };
         controls.AddChild(style);
         var volume = new HSlider { MinValue = 0, MaxValue = 100, Step = 1, Value = hitSounds.Volume * 100, CustomMinimumSize = new Vector2(120, 28), FocusMode = FocusModeEnum.None, TooltipText = "打击音量，调至 0 静音" };
-        volume.ValueChanged += value => { hitSounds.Volume = (float)value / 100; SaveUserSettings(); };
+        volume.ValueChanged += value => { soundSettings.HitSoundVolume = (float)value / 100; if (!temporary) SaveUserSettings(); };
         controls.AddChild(volume);
-        return controls;
-    }
-
-    private Control SpeedControls()
-    {
-        var controls = new VBoxContainer { TooltipText = "全局设置 · 1×：顶部到底部 1 秒；2×：0.5 秒。编辑器、游玩和试玩共用。" };
-        AddNumber(controls, "全局下落速率（×）", .2, 3, .1, ScrollRate, value => { settings.ScrollRate = value; SaveUserSettings(); });
         return controls;
     }
 
@@ -694,6 +695,6 @@ public partial class RhythmGame : Control
         catch (Exception ex) { ShowError(ex.Message); }
     }
     private void ShowError(string message) { error.DialogText = message; error.PopupCentered(new Vector2I(620, 200)); }
-    private void Toast(string message) { if (toastLife <= 0) toast = status.Text; status.Text = message; toastLife = 4; }
+    private void Toast(string message) { if (toastLife <= 0) toast = status.Text; status.Text = message; status.Show(); toastLife = 4; }
     public static string FormatTime(double seconds) => $"{(int)seconds / 60:00}:{seconds % 60:00.000}";
 }
